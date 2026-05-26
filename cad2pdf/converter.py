@@ -54,55 +54,102 @@ def _setup_matplotlib_cjk() -> None:
     matplotlib.rcParams["pdf.fonttype"] = 42  # TrueType, subset embedded
 
 
+# module-level:系統內可用的中文字型檔名,給 _render_dxf_to_pdf 覆寫 STYLE 用
+_CJK_FONT_FILENAME: str | None = None
+
+
 def _setup_ezdxf_cjk_mapping() -> None:
-    """讓 ezdxf 把工程圖常用 SHX 中文字型對應到系統 TrueType。
+    """讓 ezdxf 把工程圖常用 SHX 中文字型對應到系統的中文 TrueType。
 
     AutoCAD/Tekla 出的 DWG 文字 style 常指向 SHX 字型(例如 chineset.shx、
-    bigfont.shx),ezdxf 找不到 SHX 解析器時會 fallback 到不含 CJK 的字型,
-    導致中文渲染成方塊。手動把這些常見名字映射到系統的中文 TrueType。
+    bigfont.shx、hztxt.shx),但 ezdxf 的 SHX_FONTS 內建映射只涵蓋西文 SHX,
+    遇到中文 SHX 會直接 fallback 到 arial.ttf(無中文 glyph)→ 變方塊。
+
+    修法:
+    1. 直接寫進 ezdxf.fonts.fonts.SHX_FONTS dict,把常見中文 SHX 名稱
+       對應到系統內 ezdxf 已 cache 的中文字型檔(mingliu.ttc 等)。
+    2. 改 font_manager 的 fallback 字型,確保任何「找不到字型」的情況
+       都退回到中文字型,而不是 arial.ttf。
+    3. 記錄選到的中文字型檔名(_CJK_FONT_FILENAME),供 _render_dxf_to_pdf
+       覆寫 DWG 內錯誤的 STYLE.font 設定。
     """
-    target = None
+    global _CJK_FONT_FILENAME
     try:
         from ezdxf.fonts import fonts as ezdxf_fonts
-        # 確保系統字型已掃描(預設應該已跑)
-        try:
-            ezdxf_fonts.build_system_font_cache()
-        except Exception:
-            pass
+        fm = ezdxf_fonts.font_manager
 
-        # 找一個系統實際有的中文字型當對應目標
-        for name in _CJK_FONTS:
-            try:
-                face = ezdxf_fonts.find_font_face(name)
-            except Exception:
-                face = None
-            if face and getattr(face, "family", None):
-                target = face.family
+        # 找一個系統實際有的中文字型檔名
+        # 偏好順序:微軟正黑→雅黑→明體→Noto→簡中宋體
+        target_filename = None
+        for candidate in (
+            "msjh.ttc", "msjh.ttf",
+            "msyh.ttc", "msyh.ttf",
+            "mingliu.ttc", "pmingliu.ttf",
+            "NotoSansTC-VF.ttf", "NotoSansHK-VF.ttf", "NotoSansSC-VF.ttf",
+            "simhei.ttf", "simsun.ttc",
+        ):
+            if fm.has_font(candidate):
+                target_filename = candidate
                 break
 
-        if target is None:
-            return
+        if target_filename is None:
+            return  # 沒中文字型可用,放棄
 
-        # 常見 SHX / 字型風格名 → 中文 TrueType
-        shx_names = [
-            "chineset.shx", "chinesetbig.shx", "bigfont.shx",
-            "hzdx.shx", "hztxt.shx", "hzfs.shx", "gbcbig.shx",
-            "extfont.shx", "extfont2.shx",
-            "@MingLiU", "MingLiU", "PMingLiU", "標楷體", "DFKai-SB",
+        _CJK_FONT_FILENAME = target_filename
+
+        # 1) SHX → 中文 TrueType 對應(大寫鍵,跟 ezdxf 內建格式一致)
+        cjk_shx_names = [
+            "CHINESET", "CHINESET.SHX",
+            "CHINESETBIG", "CHINESETBIG.SHX",
+            "BIGFONT", "BIGFONT.SHX",
+            "HZTXT", "HZTXT.SHX",
+            "HZDX", "HZDX.SHX",
+            "HZFS", "HZFS.SHX",
+            "GBCBIG", "GBCBIG.SHX",
+            "HZK16", "HZK16.SHX",
+            "EXTFONT", "EXTFONT.SHX",
+            "EXTFONT2", "EXTFONT2.SHX",
+            "TSSDENG", "TSSDENG.SHX",
+            "TSSDCHN", "TSSDCHN.SHX",
         ]
-        # ezdxf 1.4 用 font_face_mapping(若 API 存在)
-        mapping = getattr(ezdxf_fonts, "font_face_mapping", None)
-        if isinstance(mapping, dict):
-            for name in shx_names:
-                mapping.setdefault(name.lower(), target)
+        for name in cjk_shx_names:
+            ezdxf_fonts.SHX_FONTS[name] = target_filename
+
+        # 2) fallback 字型也改成中文
+        try:
+            fm._fallback_font_name = target_filename
+        except Exception:
+            pass
     except Exception:
-        # 字型 fallback 是錦上添花,失敗就讓 ezdxf 用自己的 default
         pass
 
 
 # import 時就跑一次,確保下游使用前環境已就緒
 _setup_matplotlib_cjk()
 _setup_ezdxf_cjk_mapping()
+
+
+def _override_styles_to_cjk(doc) -> None:
+    """覆寫 DXF 文件內所有 STYLE 的 font 為中文字型。
+
+    背景:許多 DWG(尤其 Tekla 出的)STYLE table 設定不一致 ——
+    style 名叫 pmingliu / mingliu 但 font 屬性指向 arial.ttf。
+    ezdxf 渲染時照 STYLE.font 找字型,結果用 arial 畫中文字 → 變方塊。
+
+    解法:在 readfile 後、render 前,把所有 STYLE.font 統一改成中文 ttf。
+    Microsoft JhengHei / MingLiU 都含拉丁字符,英文文字也能正常顯示,
+    只是字型風格從 arial 變成中文字型(對工程圖預覽用途差異微小)。
+    """
+    if not _CJK_FONT_FILENAME:
+        return
+    for style in doc.styles:
+        try:
+            style.dxf.font = _CJK_FONT_FILENAME
+            # 清掉 bigfont 設定(中文 ttf 已含全字符,不需再 overlay SHX bigfont)
+            if hasattr(style.dxf, "bigfont"):
+                style.dxf.bigfont = ""
+        except Exception:
+            pass
 
 
 class ConvertMode(str, Enum):
@@ -118,6 +165,7 @@ ProgressCb = Callable[[int, int, str], None]
 def _render_dxf_to_pdf(dxf_path: Path, pdf_path: Path) -> None:
     """用 ezdxf + matplotlib 把 DXF 渲染成單頁 PDF。"""
     doc = ezdxf.readfile(str(dxf_path))
+    _override_styles_to_cjk(doc)  # 把 STYLE.font 統一改中文,解中文亂碼
     msp = doc.modelspace()
 
     fig = plt.figure(figsize=(16.5, 11.7))  # A3 橫式 (英吋)
