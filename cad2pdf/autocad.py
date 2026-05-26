@@ -209,32 +209,55 @@ class _AutoCadSession:
         except Exception:
             pass
 
-        # 開啟 DWG。Documents.Open() 在 late-binding 下回傳值有時不可靠
+        # 開啟 DWG。重點:用 read-write (False) 開檔,讓後續對 TextStyle
+        # 的 in-memory modify 確實生效。read-only 模式在某些 AutoCAD 版本
+        # 會阻擋 COM 物件 modify。Close(False) 仍不存檔,原 DWG 不會被改。
+        #
+        # Documents.Open() 在 late-binding 下回傳值有時不可靠
         # (拿到的物件 .ActiveLayout 會炸 AttributeError: Open.ActiveLayout),
         # 安全網:若 open_result 取不到屬性就改從 ActiveDocument 拿。
-        # 用 retry 包裝,避免 AutoCAD 載入中拒絕 COM 呼叫。
         open_result = _com_retry(
-            lambda: self.acad.Documents.Open(str(dwg_path), True)  # read-only
+            lambda: self.acad.Documents.Open(str(dwg_path), False)
         )
         doc = open_result if (open_result is not None and hasattr(open_result, "ActiveLayout")) \
               else self.acad.ActiveDocument
 
         # 覆寫 doc 內所有 text style 的字型 → 解中文亂碼。
         # 跟 ODA backend 同樣的問題:許多 DWG (尤其 Tekla 出的) STYLE 名叫
-        # pmingliu/mingliu,但 FontFile 指向 arial.ttf。AutoCAD 內看圖時
+        # pmingliu/mingliu,但 fontFile 指向 arial.ttf。AutoCAD 內看圖時
         # 有 fallback 顯示對,但 plot to PDF 時嵌入 arial,PDF reader 用
-        # arial 渲染中文 → 方塊。直接把 FontFile 統一改中文 ttf 就解了。
-        # (Documents.Open 用 read-only mode,Close(False) 不存檔,原 DWG 不變)
+        # arial 渲染中文 → 方塊。直接把 fontFile 統一改中文 ttf 就解了。
+        #
+        # 重點:AutoCAD COM 的屬性是 fontFile / bigFontFile(駱駝命名,首字
+        # 小寫),不是 PascalCase。EnsureDispatch (early-binding) 嚴格區分
+        # 大小寫,寫錯名稱 → AttributeError → 被 try/except 吞掉就無聲失敗。
+        _modified = 0
         try:
             for ts in doc.TextStyles:
-                try:
-                    ts.fontFile = "msjh.ttc"  # 系統內中文 ttf
+                # 多個 name 試,因為不同 AutoCAD 版本 / pywin32 typelib 不同
+                set_ok = False
+                for prop_name in ("fontFile", "FontFile"):
                     try:
-                        ts.BigFontFile = ""
+                        setattr(ts, prop_name, "msjh.ttc")
+                        set_ok = True
+                        break
                     except Exception:
-                        pass
-                except Exception:
-                    pass
+                        continue
+                if set_ok:
+                    _modified += 1
+                for prop_name in ("bigFontFile", "BigFontFile"):
+                    try:
+                        setattr(ts, prop_name, "")
+                        break
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+        # 強制 regen 讓 AutoCAD 重新讀取 style 字型設定
+        # (有些版本改 TextStyle.fontFile 後不會立即套用,要 regen 才生效)
+        try:
+            doc.SendCommand("_REGENALL\n")
         except Exception:
             pass
 
