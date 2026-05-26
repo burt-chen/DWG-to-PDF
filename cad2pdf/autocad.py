@@ -81,6 +81,40 @@ _DEFAULT_PAPER = "ISO_full_bleed_A3_(420.00_x_297.00_MM)"
 _DEFAULT_STYLE = "monochrome.ctb"
 
 
+def _com_retry(callable_, retries: int = 8, delay: float = 0.5):
+    """COM 呼叫的重試包裝 — AutoCAD 忙碌時會丟 RPC_E_CALL_REJECTED
+    (-2147418111 / 0x80010001) 或 RPC_E_SERVERCALL_RETRYLATER
+    (-2147417846 / 0x8001010A)，等一下再試通常會通。
+    """
+    last_exc = None
+    for _ in range(retries):
+        try:
+            return callable_()
+        except pythoncom.com_error as e:  # type: ignore[union-attr]
+            last_exc = e
+            hr = e.args[0] if e.args else 0
+            if hr in (-2147418111, -2147417846):  # 忙線可重試
+                time.sleep(delay)
+                continue
+            raise
+    if last_exc:
+        raise last_exc
+
+
+def _dispatch_autocad():
+    """取得 AutoCAD Application 物件 — 優先用 EnsureDispatch (early binding)，
+    失敗時 fallback 到 Dispatch (late binding)。
+
+    早期繫結能正確識別 Document / Layout 等介面，避免 dynamic dispatch 下
+    Documents.Open() 回傳的物件型別不明、後續 .ActiveLayout 取屬性失敗。
+    """
+    try:
+        return win32com.client.gencache.EnsureDispatch("AutoCAD.Application")
+    except Exception:
+        # gen_py cache 損壞 / 沒寫入權限時 fallback
+        return win32com.client.Dispatch("AutoCAD.Application")
+
+
 def is_autocad_available() -> tuple[bool, str]:
     """檢查 AutoCAD COM 是否可用。
 
@@ -92,7 +126,7 @@ def is_autocad_available() -> tuple[bool, str]:
     try:
         pythoncom.CoInitialize()
         try:
-            acad = win32com.client.Dispatch("AutoCAD.Application")
+            acad = _dispatch_autocad()
             version = acad.Version
             return True, f"已偵測到 AutoCAD（版本 {version}）"
         finally:
@@ -123,24 +157,38 @@ class _AutoCadSession:
             )
         pythoncom.CoInitialize()
         try:
-            self.acad = win32com.client.Dispatch("AutoCAD.Application")
+            self.acad = _dispatch_autocad()
         except Exception as e:
             pythoncom.CoUninitialize()
             raise AutoCadNotAvailableError(
                 f"無法啟動 AutoCAD：{e}"
             ) from e
 
-        self._previous_visible = self.acad.Visible
-        self.acad.Visible = self.visible
+        try:
+            self._previous_visible = self.acad.Visible
+            self.acad.Visible = self.visible
+        except Exception:
+            # 設定 Visible 失敗不致命,繼續走
+            self._previous_visible = None
         return self
 
     def __exit__(self, exc_type, exc, tb):
+        # cleanup 絕不能拋例外蓋過呼叫端的真正錯誤
         try:
             if self.acad is not None and self._previous_visible is not None:
-                self.acad.Visible = self._previous_visible
+                # 用 retry 包裝,AutoCAD 可能還在處理上次動作而拒絕呼叫
+                try:
+                    _com_retry(
+                        lambda: setattr(self.acad, "Visible", self._previous_visible)
+                    )
+                except Exception:
+                    pass
         finally:
             self.acad = None
-            pythoncom.CoUninitialize()
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
 
     def plot_dwg(
         self,
@@ -154,15 +202,23 @@ class _AutoCadSession:
         pdf_path = Path(pdf_path).resolve()
         pdf_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # 避免 plot 在背景非同步進行 → 我們要等它完成
-        doc = self.acad.Documents.Open(str(dwg_path), True)  # read-only
+        # 開啟 DWG。Documents.Open() 在 late-binding 下回傳值有時不可靠
+        # (拿到的物件 .ActiveLayout 會炸 AttributeError: Open.ActiveLayout),
+        # 安全網:若 open_result 取不到屬性就改從 ActiveDocument 拿。
+        # 用 retry 包裝,避免 AutoCAD 載入中拒絕 COM 呼叫。
+        open_result = _com_retry(
+            lambda: self.acad.Documents.Open(str(dwg_path), True)  # read-only
+        )
+        doc = open_result if (open_result is not None and hasattr(open_result, "ActiveLayout")) \
+              else self.acad.ActiveDocument
+
         try:
             try:
                 doc.SetVariable("BACKGROUNDPLOT", 0)
             except Exception:
                 pass  # 部分版本不允許設定，忽略
 
-            layout = doc.ActiveLayout
+            layout = _com_retry(lambda: doc.ActiveLayout)
 
             # 設定 plotter 與紙張
             try:
@@ -198,9 +254,9 @@ class _AutoCadSession:
             except Exception:
                 pass
 
-            # 輸出
+            # 輸出 — Plot 也用 retry,大檔渲染中 COM 可能短暫拒絕
             plot = doc.Plot
-            ok = plot.PlotToFile(str(pdf_path))
+            ok = _com_retry(lambda: plot.PlotToFile(str(pdf_path)))
             if not ok:
                 raise RuntimeError(
                     f"AutoCAD PlotToFile 回傳失敗：{dwg_path}"
@@ -217,7 +273,7 @@ class _AutoCadSession:
 
         finally:
             try:
-                doc.Close(False)  # 不存檔
+                _com_retry(lambda: doc.Close(False))  # 不存檔
             except Exception:
                 pass
 
