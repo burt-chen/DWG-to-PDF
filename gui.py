@@ -414,11 +414,15 @@ def _acad_check(panel: ConverterPanel) -> tuple[bool, str]:
 # ---------- 主視窗 ----------
 
 class App:
-    def __init__(self, root: Tk) -> None:
+    """主視窗（核心 UI 邏輯）。
+
+    self.root 可能是 tk.Tk（獨立執行）或任意 widget（嵌入到 launcher 分頁）。
+    本類別不呼叫 root.title/geometry/minsize — 這些屬於外層視窗的責任，
+    嵌入模式下由 launcher 控制。
+    """
+
+    def __init__(self, root: tk.Widget) -> None:
         self.root = root
-        root.title(APP_TITLE)
-        root.geometry("680x640")
-        root.minsize(600, 560)
 
         nb = ttk.Notebook(root)
         nb.pack(fill="both", expand=True, padx=8, pady=8)
@@ -447,7 +451,11 @@ class App:
 
 
 def main() -> None:
+    """獨立執行入口：建立 tk.Tk、設定視窗屬性、啟動 mainloop。"""
     root = Tk()
+    root.title(APP_TITLE)
+    root.geometry("680x640")
+    root.minsize(600, 560)
     App(root)
     root.mainloop()
 

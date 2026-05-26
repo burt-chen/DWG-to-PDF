@@ -1,0 +1,35 @@
+# Python 編譯產物
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+build/
+dist/
+*.spec
+venv/
+.venv/
+
+# IDE / 編輯器
+.vscode/
+.idea/
+*.swp
+
+# OS 暫存
+Thumbs.db
+.DS_Store
+desktop.ini
+*.tmp.*
+
+# 環境變數
+.env
+.env.local
+
+# Git 內部資料（不應該進分享 zip）
+.git/
+.gitignore
+
+# 個人測試資料（DWG / PDF 不屬於工具本身）
+零件圖/
+吊裝圖/
+*.dwg
+*.pdf
