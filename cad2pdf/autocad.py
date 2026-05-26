@@ -20,6 +20,35 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable
 
+def _ensure_pywin32_dll_path() -> None:
+    """讓 launcher 用 pip install --target 安裝的 pywin32 能找到 DLL。
+
+    pywin32 的 pywintypes / pythoncom 是動態載入 pywin32_system32/*.dll，
+    正常 install 流程會跑 post-install 把 DLL 註冊到 Python 根目錄；
+    但 --target 安裝跳過 post-install，DLL 還在 pywin32_system32/ 沒移動，
+    Python 找不到就會炸 ImportError: No module named 'pywintypes'。
+
+    對策：在 import 前用 os.add_dll_directory() 把 pywin32_system32/
+    加進 Windows 的 DLL 搜尋路徑。
+    """
+    import os
+    from pathlib import Path
+
+    # cad2pdf 的上一層 = 工具根目錄（含 pywin32_system32/ 與其他 site-packages）
+    tool_root = Path(__file__).resolve().parent.parent
+    syspath = tool_root / "pywin32_system32"
+    if syspath.is_dir() and hasattr(os, "add_dll_directory"):
+        try:
+            os.add_dll_directory(str(syspath))
+        except (OSError, ValueError):
+            pass
+    # 同時加進 PATH,給較舊的 C extension 用
+    if syspath.is_dir():
+        os.environ["PATH"] = str(syspath) + os.pathsep + os.environ.get("PATH", "")
+
+
+_ensure_pywin32_dll_path()
+
 try:
     import win32com.client
     import pythoncom
