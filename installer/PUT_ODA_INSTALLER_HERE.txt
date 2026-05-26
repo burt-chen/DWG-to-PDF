@@ -1,0 +1,19 @@
+把你下載的 ODA File Converter installer 放在這個資料夾。
+
+檔名通常長這樣（版本號可能不同），.exe 與 .msi 都支援：
+    ODAFileConverter_QT6_vc16_amd64dll_27.1.msi
+    ODAFileConverter_QT6_lnxX64_xxx.exe
+    ODAFileConverter_QT5_vc14_amd64_xxx.exe
+    ODAFileConverter_xxx.exe / .msi
+
+只要檔名開頭是 "ODAFileConverter"，副檔名是 .exe 或 .msi，GUI 就會自動偵測到。
+.msi 會透過 Windows 的 msiexec 執行。
+
+放好之後：
+1. 開啟 GUI（py main.py）
+2. 切到「ODA File Converter（免費）」分頁
+3. 如果 ODA 還沒安裝，會出現「執行安裝程式」按鈕，按下去即可
+4. 安裝完成後 GUI 會自動重新偵測 ODA 路徑
+
+下載連結（首次取得 installer 時用）：
+    https://www.opendesign.com/guestfiles/oda_file_converter

@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# Build / 暫存
+build/
+dist/
+*.spec
+*.tmp.*
+
+# 工作資料夾（DWG 屬於工程資料，不進版控；installer 內的 MSI 要保留）
+零件圖/
+吊裝圖/
+*.dwg
+
+# PDF 輸出
+*.pdf
