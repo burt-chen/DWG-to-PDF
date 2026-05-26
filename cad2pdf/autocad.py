@@ -202,6 +202,13 @@ class _AutoCadSession:
         pdf_path = Path(pdf_path).resolve()
         pdf_path.parent.mkdir(parents=True, exist_ok=True)
 
+        # 全域變數:讓 SHX 中文字型輸出時以 vector path 嵌入 PDF,
+        # 解掉「DWG 顯示正常但 PDF 內中文變方塊」(SHX 字型在 PDF 沒對應字型)
+        try:
+            self.acad.SetVariable("PDFSHX", 1)
+        except Exception:
+            pass
+
         # 開啟 DWG。Documents.Open() 在 late-binding 下回傳值有時不可靠
         # (拿到的物件 .ActiveLayout 會炸 AttributeError: Open.ActiveLayout),
         # 安全網:若 open_result 取不到屬性就改從 ActiveDocument 拿。
