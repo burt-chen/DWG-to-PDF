@@ -203,7 +203,7 @@ class _AutoCadSession:
         pdf_path.parent.mkdir(parents=True, exist_ok=True)
 
         # 全域變數:讓 SHX 中文字型輸出時以 vector path 嵌入 PDF,
-        # 解掉「DWG 顯示正常但 PDF 內中文變方塊」(SHX 字型在 PDF 沒對應字型)
+        # 解掉 SHX 字型沒嵌入 PDF 字型表的情況
         try:
             self.acad.SetVariable("PDFSHX", 1)
         except Exception:
@@ -218,6 +218,25 @@ class _AutoCadSession:
         )
         doc = open_result if (open_result is not None and hasattr(open_result, "ActiveLayout")) \
               else self.acad.ActiveDocument
+
+        # 覆寫 doc 內所有 text style 的字型 → 解中文亂碼。
+        # 跟 ODA backend 同樣的問題:許多 DWG (尤其 Tekla 出的) STYLE 名叫
+        # pmingliu/mingliu,但 FontFile 指向 arial.ttf。AutoCAD 內看圖時
+        # 有 fallback 顯示對,但 plot to PDF 時嵌入 arial,PDF reader 用
+        # arial 渲染中文 → 方塊。直接把 FontFile 統一改中文 ttf 就解了。
+        # (Documents.Open 用 read-only mode,Close(False) 不存檔,原 DWG 不變)
+        try:
+            for ts in doc.TextStyles:
+                try:
+                    ts.fontFile = "msjh.ttc"  # 系統內中文 ttf
+                    try:
+                        ts.BigFontFile = ""
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
         try:
             try:
