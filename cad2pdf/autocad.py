@@ -138,6 +138,81 @@ def is_autocad_available() -> tuple[bool, str]:
         )
 
 
+def _build_cjk_fontmap_file() -> Path | None:
+    """建立一個 AutoCAD fontmap (.fmp) 檔,把常見西文/SHX 字型映射到中文 ttf。
+
+    AutoCAD 的 FONTMAP 系統變數指向這個檔,plot / regen 時會用內含的對應表
+    替換字型。這是「全域」的字型替代,比改 doc.TextStyles 更可靠 ——
+    即使 STYLE.fontFile 改不動,plot 出來時 AutoCAD 仍會跑 fontmap 替換。
+
+    挑系統實際有的中文字型當目標。回傳 fmp 檔路徑;系統無中文字型回 None。
+    """
+    import os
+    import tempfile
+
+    # Windows 字型目錄,優先嘗試的中文 ttf
+    fonts_dir = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
+    candidates = [
+        "msjh.ttc", "msjh.ttf",      # 微軟正黑體
+        "msyh.ttc", "msyh.ttf",      # 微軟雅黑
+        "mingliu.ttc", "pmingliu.ttf",  # 細明體
+        "NotoSansTC-VF.ttf", "NotoSansHK-VF.ttf", "NotoSansSC-VF.ttf",
+        "simhei.ttf", "simsun.ttc",
+    ]
+    target = next(
+        (c for c in candidates if (fonts_dir / c).is_file()),
+        None,
+    )
+    if target is None:
+        return None
+
+    # AutoCAD .fmp 格式: 一行一條 "原字型;替換字型"
+    # 不分 SHX / TTF,常見會走 fallback 的字型都列出
+    mappings = [
+        # 西文 TTF (DWG STYLE 內最常見的 misconfig)
+        "arial;" + target,
+        "arial.ttf;" + target,
+        "ARIAL;" + target,
+        "ARIAL.TTF;" + target,
+        "tahoma;" + target,
+        "tahoma.ttf;" + target,
+        "verdana;" + target,
+        "calibri;" + target,
+        # AutoCAD 預設西文 SHX (Standard style 預設用 txt)
+        "txt;" + target,
+        "txt.shx;" + target,
+        "simplex;" + target,
+        "simplex.shx;" + target,
+        "romans;" + target,
+        "romans.shx;" + target,
+        # 中文 SHX (找不到 SHX 解析時 fallback)
+        "chineset;" + target,
+        "chineset.shx;" + target,
+        "chinesetbig;" + target,
+        "bigfont;" + target,
+        "bigfont.shx;" + target,
+        "hztxt;" + target,
+        "hztxt.shx;" + target,
+        "hzdx;" + target,
+        "gbcbig;" + target,
+        "gbcbig.shx;" + target,
+        "extfont;" + target,
+        "extfont2;" + target,
+    ]
+    fmp_dir = Path(tempfile.gettempdir()) / "cad2pdf_acad"
+    fmp_dir.mkdir(parents=True, exist_ok=True)
+    fmp_path = fmp_dir / "cjk_fontmap.fmp"
+    fmp_path.write_text("\n".join(mappings) + "\n", encoding="ascii")
+    return fmp_path
+
+
+# 在 module load 時就準備好 fontmap 檔(便宜操作,失敗不致命)
+try:
+    _CJK_FONTMAP_FILE = _build_cjk_fontmap_file()
+except Exception:
+    _CJK_FONTMAP_FILE = None
+
+
 class _AutoCadSession:
     """AutoCAD 應用程式 session 管理 — context manager。
 
@@ -149,6 +224,7 @@ class _AutoCadSession:
         self.visible = visible
         self.acad = None
         self._previous_visible = None
+        self._previous_fontmap = None
 
     def __enter__(self):
         if not _PYWIN32_OK:
@@ -170,19 +246,43 @@ class _AutoCadSession:
         except Exception:
             # 設定 Visible 失敗不致命,繼續走
             self._previous_visible = None
+
+        # 設 FONTMAP 變數指向我們的 fmp 檔,AutoCAD plot 時會自動替換字型
+        # (例如 arial → msjh.ttc),解中文亂碼。
+        # 這比改 doc.TextStyles 更可靠 —— 即使 STYLE 改不動,plot 內部
+        # 的字型查找仍會走 fontmap。
+        if _CJK_FONTMAP_FILE is not None:
+            try:
+                self._previous_fontmap = self.acad.GetVariable("FONTMAP")
+            except Exception:
+                self._previous_fontmap = None
+            try:
+                self.acad.SetVariable("FONTMAP", str(_CJK_FONTMAP_FILE))
+            except Exception:
+                pass
+
         return self
 
     def __exit__(self, exc_type, exc, tb):
         # cleanup 絕不能拋例外蓋過呼叫端的真正錯誤
         try:
-            if self.acad is not None and self._previous_visible is not None:
-                # 用 retry 包裝,AutoCAD 可能還在處理上次動作而拒絕呼叫
-                try:
-                    _com_retry(
-                        lambda: setattr(self.acad, "Visible", self._previous_visible)
-                    )
-                except Exception:
-                    pass
+            if self.acad is not None:
+                # 恢復 FONTMAP 變數
+                if self._previous_fontmap is not None:
+                    try:
+                        _com_retry(
+                            lambda: self.acad.SetVariable("FONTMAP", self._previous_fontmap)
+                        )
+                    except Exception:
+                        pass
+                # 恢復 Visible
+                if self._previous_visible is not None:
+                    try:
+                        _com_retry(
+                            lambda: setattr(self.acad, "Visible", self._previous_visible)
+                        )
+                    except Exception:
+                        pass
         finally:
             self.acad = None
             try:
