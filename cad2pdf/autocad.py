@@ -321,8 +321,25 @@ class _AutoCadSession:
         open_result = _com_retry(
             lambda: self.acad.Documents.Open(str(dwg_path), False)
         )
-        doc = open_result if (open_result is not None and hasattr(open_result, "ActiveLayout")) \
-              else self.acad.ActiveDocument
+        # 等 AutoCAD 載入完成,避免後續 COM call 立刻 RPC_E_CALL_REJECTED
+        time.sleep(1.0)
+
+        # 取 doc:open_result 屬性 access 用 _com_retry 包,然後若不可用
+        # 退到 ActiveDocument。不用 hasattr (它會觸發 getattr,失敗無法 retry)。
+        def _get_layout():
+            return open_result.ActiveLayout if open_result is not None else None
+
+        doc = None
+        try:
+            _com_retry(_get_layout)
+            doc = open_result
+        except Exception as e:
+            _diag(f"open_result.ActiveLayout 失敗,改用 ActiveDocument: {e}")
+            try:
+                doc = _com_retry(lambda: self.acad.ActiveDocument)
+            except Exception as e2:
+                _diag(f"取 ActiveDocument 也失敗: {e2}")
+                raise
 
         # 透過 doc 設變數 (SetVariable 在 IAcadDocument 上,不是 IAcadApplication)
         try:
@@ -450,34 +467,20 @@ class _AutoCadSession:
             except Exception:
                 pass
 
-            # 輸出 — 優先用 doc.Export("PDF") 走新版 PDF engine,
-            # 字型嵌入對中文支援比 PlotToFile + DWG-to-PDF.pc3 更好。
-            # 失敗才 fallback 到 PlotToFile。
-            #
-            # 預先刪掉舊 PDF,避免 Export 因檔案存在跳互動 dialog
+            # 預先刪掉舊 PDF,避免存在時跳互動 dialog
             try:
                 if pdf_path.exists():
                     pdf_path.unlink()
             except Exception:
                 pass
 
-            exported = False
-            try:
-                _diag(f"嘗試 doc.Export('PDF') → {pdf_path}")
-                _com_retry(lambda: doc.Export(str(pdf_path), "PDF", None))
-                exported = True
-                _diag("doc.Export 回傳成功")
-            except Exception as e:
-                _diag(f"doc.Export 失敗,fallback 到 PlotToFile: {e}")
-
-            if not exported:
-                plot = doc.Plot
-                ok = _com_retry(lambda: plot.PlotToFile(str(pdf_path)))
-                _diag(f"PlotToFile 回傳 ok={ok}")
-                if not ok:
-                    raise RuntimeError(
-                        f"AutoCAD PlotToFile 回傳失敗:{dwg_path}"
-                    )
+            # 輸出 — 用 PlotToFile + DWG-to-PDF.pc3
+            # (doc.Export("PDF") 在 AutoCAD 2024 拋「無效的引數」,先不走那條)
+            plot = doc.Plot
+            ok = _com_retry(lambda: plot.PlotToFile(str(pdf_path)))
+            _diag(f"PlotToFile 回傳 ok={ok}")
+            if not ok:
+                raise RuntimeError(f"AutoCAD PlotToFile 回傳失敗:{dwg_path}")
 
             # 等檔案落地（AutoCAD 有時非同步）
             for _ in range(60):
