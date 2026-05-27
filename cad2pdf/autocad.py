@@ -241,6 +241,56 @@ except Exception:
     _CJK_FONTMAP_FILE = None
 
 
+def _export_pdf_via_command(doc, pdf_path: Path) -> bool:
+    """用 SendCommand 跑 _-EXPORTPDF 命令輸出 PDF。
+
+    走 AutoCAD 較新的 PDF engine,對中文字型嵌入處理比 PlotToFile +
+    DWG-to-PDF.pc3 較完整。
+
+    SendCommand 是異步命令,送出後在 background 執行,要 polling 等檔案
+    產出 + size 穩定才能 return。
+
+    回傳 True 表示成功產出;False 表示沒產出(讓上層 fallback)。
+    """
+    # AutoCAD 預設讓 -EXPORTPDF 跳過 dialog 的 prompt 順序(2024):
+    #   [Current/All/Display/Extents/Window] <Current>: _C
+    #   Page setup override [Yes/No] <No>: _N
+    #   PDF filename: "path"
+    # 多按幾個 \n 跳過版本間 prompt 差異。
+    pdf_str = str(pdf_path).replace("/", "\\")
+    cmd = f'_-EXPORTPDF\n_C\n_N\n"{pdf_str}"\n\n\n'
+
+    try:
+        _diag(f"SendCommand(_-EXPORTPDF) → {pdf_path}")
+        _com_retry(lambda: doc.SendCommand(cmd))
+    except Exception as e:
+        _diag(f"SendCommand(_-EXPORTPDF) 失敗: {e}")
+        return False
+
+    # SendCommand 異步,等檔案出現 + size 穩定 (最多 60 秒)
+    last_size = 0
+    stable_count = 0
+    for i in range(120):
+        time.sleep(0.5)
+        if not pdf_path.is_file():
+            continue
+        size = pdf_path.stat().st_size
+        if size > 0 and size == last_size:
+            stable_count += 1
+            if stable_count >= 3:  # 連續 1.5 秒沒變動 → 寫完
+                _diag(f"  EXPORTPDF 落地 size={size} after {i*0.5:.1f}s")
+                return True
+        else:
+            stable_count = 0
+        last_size = size
+
+    if pdf_path.is_file() and pdf_path.stat().st_size > 0:
+        _diag(f"  EXPORTPDF size={pdf_path.stat().st_size} (60s 後仍變動,當成功)")
+        return True
+    _diag("  EXPORTPDF 等了 60 秒沒產出檔案")
+    return False
+
+
 class _AutoCadSession:
     """AutoCAD 應用程式 session 管理 — context manager。
 
@@ -474,19 +524,28 @@ class _AutoCadSession:
             except Exception:
                 pass
 
-            # 輸出 — 用 PlotToFile + DWG-to-PDF.pc3
-            # (doc.Export("PDF") 在 AutoCAD 2024 拋「無效的引數」,先不走那條)
-            plot = doc.Plot
-            ok = _com_retry(lambda: plot.PlotToFile(str(pdf_path)))
-            _diag(f"PlotToFile 回傳 ok={ok}")
-            if not ok:
-                raise RuntimeError(f"AutoCAD PlotToFile 回傳失敗:{dwg_path}")
+            # 輸出策略:優先 SendCommand("_-EXPORTPDF") 走較新的 PDF engine
+            # (對中文字型嵌入 subset 處理較好);失敗 fallback 到 PlotToFile。
+            #
+            # _-EXPORTPDF (dash 版本) prompt 順序 (AutoCAD 2024):
+            #   Specify selection or [All/Window/Display/Extents]:  → _C (current)
+            #   或 Page setup override [Yes/No]: → _N
+            #   PDF filename: → "..."
+            # 多按 \n 緩衝跳過版本間 prompt 差異。
+            exported = _export_pdf_via_command(doc, pdf_path)
 
-            # 等檔案落地（AutoCAD 有時非同步）
-            for _ in range(60):
-                if pdf_path.is_file() and pdf_path.stat().st_size > 0:
-                    break
-                time.sleep(0.3)
+            if not exported:
+                _diag("EXPORTPDF 命令未產出 PDF,fallback 到 PlotToFile")
+                plot = doc.Plot
+                ok = _com_retry(lambda: plot.PlotToFile(str(pdf_path)))
+                _diag(f"PlotToFile 回傳 ok={ok}")
+                if not ok:
+                    raise RuntimeError(f"AutoCAD PlotToFile 回傳失敗:{dwg_path}")
+                # 等檔案落地
+                for _ in range(60):
+                    if pdf_path.is_file() and pdf_path.stat().st_size > 0:
+                        break
+                    time.sleep(0.3)
 
             if not pdf_path.is_file() or pdf_path.stat().st_size == 0:
                 raise RuntimeError(f"PDF 沒有產生或為空檔：{pdf_path}")
