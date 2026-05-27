@@ -281,48 +281,21 @@ class _AutoCadSession:
         except Exception as e:
             _diag(f"acad.Version 讀取失敗: {e}")
         _diag(f"_CJK_FONTMAP_FILE = {_CJK_FONTMAP_FILE}")
-
-        # 設 FONTMAP 變數指向我們的 fmp 檔,AutoCAD plot 時會自動替換字型
-        if _CJK_FONTMAP_FILE is not None:
-            try:
-                self._previous_fontmap = self.acad.GetVariable("FONTMAP")
-                _diag(f"FONTMAP before: {self._previous_fontmap!r}")
-            except Exception as e:
-                _diag(f"GetVariable(FONTMAP) 失敗: {e}")
-                self._previous_fontmap = None
-            try:
-                self.acad.SetVariable("FONTMAP", str(_CJK_FONTMAP_FILE))
-                _diag(f"SetVariable(FONTMAP) 完成")
-            except Exception as e:
-                _diag(f"SetVariable(FONTMAP) 失敗: {e}")
-            try:
-                actual = self.acad.GetVariable("FONTMAP")
-                _diag(f"FONTMAP after: {actual!r}")
-            except Exception as e:
-                _diag(f"GetVariable(FONTMAP) 驗證失敗: {e}")
+        # 註:SetVariable/GetVariable 在 IAcadDocument 上,不是 IAcadApplication。
+        # FONTMAP / PDFSHX 等變數的設定移到 plot_dwg 內 Open doc 之後執行。
 
         return self
 
     def __exit__(self, exc_type, exc, tb):
         # cleanup 絕不能拋例外蓋過呼叫端的真正錯誤
         try:
-            if self.acad is not None:
-                # 恢復 FONTMAP 變數
-                if self._previous_fontmap is not None:
-                    try:
-                        _com_retry(
-                            lambda: self.acad.SetVariable("FONTMAP", self._previous_fontmap)
-                        )
-                    except Exception:
-                        pass
-                # 恢復 Visible
-                if self._previous_visible is not None:
-                    try:
-                        _com_retry(
-                            lambda: setattr(self.acad, "Visible", self._previous_visible)
-                        )
-                    except Exception:
-                        pass
+            if self.acad is not None and self._previous_visible is not None:
+                try:
+                    _com_retry(
+                        lambda: setattr(self.acad, "Visible", self._previous_visible)
+                    )
+                except Exception:
+                    pass
         finally:
             self.acad = None
             try:
@@ -344,84 +317,96 @@ class _AutoCadSession:
 
         _diag(f"=== plot_dwg: {dwg_path.name} ===")
 
-        # 全域變數:讓 SHX 中文字型輸出時以 vector path 嵌入 PDF
-        try:
-            self.acad.SetVariable("PDFSHX", 1)
-            _diag(f"PDFSHX set to 1, actual = {self.acad.GetVariable('PDFSHX')}")
-        except Exception as e:
-            _diag(f"SetVariable(PDFSHX) 失敗: {e}")
-
-        # 開啟 DWG。重點:用 read-write (False) 開檔,讓後續對 TextStyle
-        # 的 in-memory modify 確實生效。read-only 模式在某些 AutoCAD 版本
-        # 會阻擋 COM 物件 modify。Close(False) 仍不存檔,原 DWG 不會被改。
-        #
-        # Documents.Open() 在 late-binding 下回傳值有時不可靠
-        # (拿到的物件 .ActiveLayout 會炸 AttributeError: Open.ActiveLayout),
-        # 安全網:若 open_result 取不到屬性就改從 ActiveDocument 拿。
+        # 開啟 DWG (read-write,Close(False) 不存檔)
         open_result = _com_retry(
             lambda: self.acad.Documents.Open(str(dwg_path), False)
         )
         doc = open_result if (open_result is not None and hasattr(open_result, "ActiveLayout")) \
               else self.acad.ActiveDocument
 
-        # 覆寫 doc 內所有 text style 的字型 → 解中文亂碼。
+        # 透過 doc 設變數 (SetVariable 在 IAcadDocument 上,不是 IAcadApplication)
+        try:
+            doc.SetVariable("PDFSHX", 1)
+            _diag(f"doc.SetVariable(PDFSHX, 1) → actual={doc.GetVariable('PDFSHX')}")
+        except Exception as e:
+            _diag(f"doc.SetVariable(PDFSHX) 失敗: {e}")
+
+        if _CJK_FONTMAP_FILE is not None:
+            try:
+                doc.SetVariable("FONTMAP", str(_CJK_FONTMAP_FILE))
+                _diag(f"doc.SetVariable(FONTMAP) → actual={doc.GetVariable('FONTMAP')!r}")
+            except Exception as e:
+                _diag(f"doc.SetVariable(FONTMAP) 失敗: {e}")
+
+        # TextStyle.fontFile 改用「絕對路徑」設定,因為 AutoCAD 的字型搜尋
+        # 路徑不一定包含 C:\Windows\Fonts,只給檔名會拋 OLE「檔案錯誤」。
+        cjk_full_path = None
+        if _CJK_FONTMAP_FILE is not None:
+            # 從 fmp 內第一條取出目標字型檔名
+            try:
+                first = _CJK_FONTMAP_FILE.read_text(encoding="ascii").splitlines()[0]
+                _, target_name = first.split(";", 1)
+                full = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts" / target_name
+                if full.is_file():
+                    cjk_full_path = str(full)
+            except Exception as e:
+                _diag(f"解析中文字型絕對路徑失敗: {e}")
+        _diag(f"cjk_full_path for fontFile = {cjk_full_path!r}")
+
         _modified = 0
         _ts_total = 0
-        try:
-            for ts in doc.TextStyles:
-                _ts_total += 1
-                name = "?"
-                before = "?"
-                try:
-                    name = ts.Name
-                except Exception:
-                    pass
-                for prop_name in ("fontFile", "FontFile"):
+        if cjk_full_path:
+            try:
+                for ts in doc.TextStyles:
+                    _ts_total += 1
                     try:
-                        before = getattr(ts, prop_name)
-                        break
+                        name = ts.Name
                     except Exception:
-                        continue
-                set_ok = False
-                set_via = None
-                for prop_name in ("fontFile", "FontFile"):
+                        name = "?"
                     try:
-                        setattr(ts, prop_name, "msjh.ttc")
+                        before = ts.fontFile
+                    except Exception:
+                        before = "?"
+                    set_ok = False
+                    # AutoCAD COM:屬性叫 fontFile (從 log 確認大寫 FontFile 不存在)
+                    try:
+                        ts.fontFile = cjk_full_path
                         set_ok = True
-                        set_via = prop_name
-                        break
                     except Exception as e:
-                        _diag(f"  setattr({prop_name}) on style {name!r} 失敗: {e}")
-                        continue
-                after = "?"
-                for prop_name in ("fontFile", "FontFile"):
+                        _diag(f"  setattr(fontFile=絕對路徑) on {name!r} 失敗: {e}")
+                        # 再退一步試純檔名
+                        try:
+                            ts.fontFile = Path(cjk_full_path).name
+                            set_ok = True
+                        except Exception as e2:
+                            _diag(f"  setattr(fontFile=檔名) on {name!r} 也失敗: {e2}")
                     try:
-                        after = getattr(ts, prop_name)
-                        break
+                        after = ts.fontFile
                     except Exception:
-                        continue
-                _diag(
-                    f"  style {name!r}: before={before!r} via={set_via} "
-                    f"after={after!r} ok={set_ok}"
-                )
-                if set_ok:
-                    _modified += 1
-                for prop_name in ("bigFontFile", "BigFontFile"):
+                        after = "?"
+                    _diag(f"  style {name!r}: before={before!r} after={after!r} ok={set_ok}")
+                    if set_ok:
+                        _modified += 1
                     try:
-                        setattr(ts, prop_name, "")
-                        break
+                        ts.bigFontFile = ""
                     except Exception:
-                        continue
-        except Exception as e:
-            _diag(f"遍歷 TextStyles 例外: {e}")
+                        pass
+            except Exception as e:
+                _diag(f"遍歷 TextStyles 例外: {e}")
         _diag(f"TextStyle modify result: total={_ts_total} modified={_modified}")
 
-        # 強制 regen
+        # 強制 regen 讓 AutoCAD 重新讀取 style 字型設定
         try:
-            doc.SendCommand("_REGENALL\n")
-            _diag("SendCommand(_REGENALL) sent")
+            doc.Regen(1)  # acAllViewports
+            _diag("doc.Regen(acAllViewports) done")
         except Exception as e:
-            _diag(f"SendCommand(_REGENALL) 失敗: {e}")
+            _diag(f"doc.Regen 失敗: {e}")
+            # fallback: SendCommand
+            try:
+                doc.SendCommand("_REGENALL\n")
+                _diag("SendCommand(_REGENALL) sent")
+            except Exception as e2:
+                _diag(f"SendCommand(_REGENALL) 失敗: {e2}")
 
         try:
             try:
