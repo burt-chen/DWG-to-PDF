@@ -16,9 +16,37 @@ from __future__ import annotations
 import os
 import tempfile
 import time
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Callable
+
+
+# ───────── 診斷 log:寫到 %TEMP%\cad2pdf_acad_diag.log ─────────
+# 中文亂碼這類問題在 BIMer 端遠端 debug 不易,把 AutoCAD 內部實際狀態
+# (FONTMAP / PDFSHX / TextStyle.fontFile 等) 寫到 log 檔給使用者貼回來。
+_DIAG_LOG = Path(tempfile.gettempdir()) / "cad2pdf_acad_diag.log"
+
+
+def _diag(msg: str) -> None:
+    """寫一行診斷訊息到 log 檔。失敗安靜放過。"""
+    try:
+        with open(_DIAG_LOG, "a", encoding="utf-8") as f:
+            f.write(f"[{datetime.now().isoformat(timespec='seconds')}] {msg}\n")
+    except Exception:
+        pass
+
+
+def _diag_reset() -> None:
+    """每次 GUI 點開始轉檔時呼叫,把 log 清空,只留本次紀錄。"""
+    try:
+        _DIAG_LOG.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def get_diag_log_path() -> Path:
+    return _DIAG_LOG
 
 def _ensure_pywin32_dll_path() -> None:
     """讓 launcher 用 pip install --target 安裝的 pywin32 能找到 DLL。
@@ -247,19 +275,31 @@ class _AutoCadSession:
             # 設定 Visible 失敗不致命,繼續走
             self._previous_visible = None
 
+        _diag(f"=== session __enter__ ===")
+        try:
+            _diag(f"AutoCAD.Version = {self.acad.Version}")
+        except Exception as e:
+            _diag(f"acad.Version 讀取失敗: {e}")
+        _diag(f"_CJK_FONTMAP_FILE = {_CJK_FONTMAP_FILE}")
+
         # 設 FONTMAP 變數指向我們的 fmp 檔,AutoCAD plot 時會自動替換字型
-        # (例如 arial → msjh.ttc),解中文亂碼。
-        # 這比改 doc.TextStyles 更可靠 —— 即使 STYLE 改不動,plot 內部
-        # 的字型查找仍會走 fontmap。
         if _CJK_FONTMAP_FILE is not None:
             try:
                 self._previous_fontmap = self.acad.GetVariable("FONTMAP")
-            except Exception:
+                _diag(f"FONTMAP before: {self._previous_fontmap!r}")
+            except Exception as e:
+                _diag(f"GetVariable(FONTMAP) 失敗: {e}")
                 self._previous_fontmap = None
             try:
                 self.acad.SetVariable("FONTMAP", str(_CJK_FONTMAP_FILE))
-            except Exception:
-                pass
+                _diag(f"SetVariable(FONTMAP) 完成")
+            except Exception as e:
+                _diag(f"SetVariable(FONTMAP) 失敗: {e}")
+            try:
+                actual = self.acad.GetVariable("FONTMAP")
+                _diag(f"FONTMAP after: {actual!r}")
+            except Exception as e:
+                _diag(f"GetVariable(FONTMAP) 驗證失敗: {e}")
 
         return self
 
@@ -302,12 +342,14 @@ class _AutoCadSession:
         pdf_path = Path(pdf_path).resolve()
         pdf_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # 全域變數:讓 SHX 中文字型輸出時以 vector path 嵌入 PDF,
-        # 解掉 SHX 字型沒嵌入 PDF 字型表的情況
+        _diag(f"=== plot_dwg: {dwg_path.name} ===")
+
+        # 全域變數:讓 SHX 中文字型輸出時以 vector path 嵌入 PDF
         try:
             self.acad.SetVariable("PDFSHX", 1)
-        except Exception:
-            pass
+            _diag(f"PDFSHX set to 1, actual = {self.acad.GetVariable('PDFSHX')}")
+        except Exception as e:
+            _diag(f"SetVariable(PDFSHX) 失敗: {e}")
 
         # 開啟 DWG。重點:用 read-write (False) 開檔,讓後續對 TextStyle
         # 的 in-memory modify 確實生效。read-only 模式在某些 AutoCAD 版本
@@ -323,26 +365,45 @@ class _AutoCadSession:
               else self.acad.ActiveDocument
 
         # 覆寫 doc 內所有 text style 的字型 → 解中文亂碼。
-        # 跟 ODA backend 同樣的問題:許多 DWG (尤其 Tekla 出的) STYLE 名叫
-        # pmingliu/mingliu,但 fontFile 指向 arial.ttf。AutoCAD 內看圖時
-        # 有 fallback 顯示對,但 plot to PDF 時嵌入 arial,PDF reader 用
-        # arial 渲染中文 → 方塊。直接把 fontFile 統一改中文 ttf 就解了。
-        #
-        # 重點:AutoCAD COM 的屬性是 fontFile / bigFontFile(駱駝命名,首字
-        # 小寫),不是 PascalCase。EnsureDispatch (early-binding) 嚴格區分
-        # 大小寫,寫錯名稱 → AttributeError → 被 try/except 吞掉就無聲失敗。
         _modified = 0
+        _ts_total = 0
         try:
             for ts in doc.TextStyles:
-                # 多個 name 試,因為不同 AutoCAD 版本 / pywin32 typelib 不同
+                _ts_total += 1
+                name = "?"
+                before = "?"
+                try:
+                    name = ts.Name
+                except Exception:
+                    pass
+                for prop_name in ("fontFile", "FontFile"):
+                    try:
+                        before = getattr(ts, prop_name)
+                        break
+                    except Exception:
+                        continue
                 set_ok = False
+                set_via = None
                 for prop_name in ("fontFile", "FontFile"):
                     try:
                         setattr(ts, prop_name, "msjh.ttc")
                         set_ok = True
+                        set_via = prop_name
+                        break
+                    except Exception as e:
+                        _diag(f"  setattr({prop_name}) on style {name!r} 失敗: {e}")
+                        continue
+                after = "?"
+                for prop_name in ("fontFile", "FontFile"):
+                    try:
+                        after = getattr(ts, prop_name)
                         break
                     except Exception:
                         continue
+                _diag(
+                    f"  style {name!r}: before={before!r} via={set_via} "
+                    f"after={after!r} ok={set_ok}"
+                )
                 if set_ok:
                     _modified += 1
                 for prop_name in ("bigFontFile", "BigFontFile"):
@@ -351,15 +412,16 @@ class _AutoCadSession:
                         break
                     except Exception:
                         continue
-        except Exception:
-            pass
+        except Exception as e:
+            _diag(f"遍歷 TextStyles 例外: {e}")
+        _diag(f"TextStyle modify result: total={_ts_total} modified={_modified}")
 
-        # 強制 regen 讓 AutoCAD 重新讀取 style 字型設定
-        # (有些版本改 TextStyle.fontFile 後不會立即套用,要 regen 才生效)
+        # 強制 regen
         try:
             doc.SendCommand("_REGENALL\n")
-        except Exception:
-            pass
+            _diag("SendCommand(_REGENALL) sent")
+        except Exception as e:
+            _diag(f"SendCommand(_REGENALL) 失敗: {e}")
 
         try:
             try:
@@ -479,6 +541,10 @@ def acad_convert_folder(
     dwgs = _iter_dwg_files(folder, recursive)
     if not dwgs:
         return []
+
+    # 每次批次開始時清空診斷 log
+    _diag_reset()
+    _diag(f"acad_convert_folder start: folder={folder} mode={mode} files={len(dwgs)}")
 
     total = len(dwgs)
     produced: list[Path] = []
