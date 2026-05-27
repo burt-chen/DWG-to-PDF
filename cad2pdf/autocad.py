@@ -450,22 +450,44 @@ class _AutoCadSession:
             except Exception:
                 pass
 
-            # 輸出 — Plot 也用 retry,大檔渲染中 COM 可能短暫拒絕
-            plot = doc.Plot
-            ok = _com_retry(lambda: plot.PlotToFile(str(pdf_path)))
-            if not ok:
-                raise RuntimeError(
-                    f"AutoCAD PlotToFile 回傳失敗：{dwg_path}"
-                )
+            # 輸出 — 優先用 doc.Export("PDF") 走新版 PDF engine,
+            # 字型嵌入對中文支援比 PlotToFile + DWG-to-PDF.pc3 更好。
+            # 失敗才 fallback 到 PlotToFile。
+            #
+            # 預先刪掉舊 PDF,避免 Export 因檔案存在跳互動 dialog
+            try:
+                if pdf_path.exists():
+                    pdf_path.unlink()
+            except Exception:
+                pass
+
+            exported = False
+            try:
+                _diag(f"嘗試 doc.Export('PDF') → {pdf_path}")
+                _com_retry(lambda: doc.Export(str(pdf_path), "PDF", None))
+                exported = True
+                _diag("doc.Export 回傳成功")
+            except Exception as e:
+                _diag(f"doc.Export 失敗,fallback 到 PlotToFile: {e}")
+
+            if not exported:
+                plot = doc.Plot
+                ok = _com_retry(lambda: plot.PlotToFile(str(pdf_path)))
+                _diag(f"PlotToFile 回傳 ok={ok}")
+                if not ok:
+                    raise RuntimeError(
+                        f"AutoCAD PlotToFile 回傳失敗:{dwg_path}"
+                    )
 
             # 等檔案落地（AutoCAD 有時非同步）
-            for _ in range(30):
+            for _ in range(60):
                 if pdf_path.is_file() and pdf_path.stat().st_size > 0:
                     break
-                time.sleep(0.2)
+                time.sleep(0.3)
 
             if not pdf_path.is_file() or pdf_path.stat().st_size == 0:
                 raise RuntimeError(f"PDF 沒有產生或為空檔：{pdf_path}")
+            _diag(f"PDF 落地 size={pdf_path.stat().st_size}")
 
         finally:
             try:
