@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
 import threading
 import traceback
 from pathlib import Path
@@ -27,6 +29,24 @@ from cad2pdf import (
     acad_convert_folder,
     is_autocad_available,
 )
+from cad2pdf.autocad import get_diag_log_path
+
+
+def _reveal_in_explorer(path: Path) -> None:
+    """在檔案總管打開指定路徑;若是檔案則選取它,若是資料夾則打開該資料夾。"""
+    if not path.exists():
+        # 檔案不存在就退回打開父資料夾
+        target = path.parent
+        if not target.exists():
+            messagebox.showwarning(APP_TITLE, f"路徑不存在:\n{path}")
+            return
+        subprocess.Popen(["explorer", str(target)])
+        return
+    if path.is_file():
+        # explorer /select, "path" 會打開資料夾並 highlight 該檔
+        subprocess.Popen(["explorer", "/select,", str(path)])
+    else:
+        subprocess.Popen(["explorer", str(path)])
 
 
 APP_TITLE = "DWG → PDF 轉檔工具"
@@ -394,6 +414,18 @@ def _build_acad_extras(panel: ConverterPanel) -> None:
         row, text="轉檔時顯示 AutoCAD 視窗（除錯用，平時不需勾）",
         variable=panel.visible_var,
     ).pack(anchor="w", padx=10, pady=4)
+
+    # 診斷 log 按鈕(中文亂碼 / COM 例外 debug 用)
+    diag_row = ttk.Frame(row)
+    diag_row.pack(fill="x", padx=10, pady=4)
+    ttk.Button(
+        diag_row, text="開啟診斷 log 位置",
+        command=lambda: _reveal_in_explorer(get_diag_log_path()),
+    ).pack(side="left")
+    ttk.Label(
+        diag_row, text="(轉檔過程的 FONTMAP / TextStyle / 例外紀錄)",
+        foreground="#666",
+    ).pack(side="left", padx=8)
 
     # 偵測 AutoCAD
     ok, msg = is_autocad_available()
