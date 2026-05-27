@@ -101,8 +101,15 @@ class ConvertMode(str, Enum):
 ProgressCb = Callable[[int, int, str], None]
 
 
-# AutoCAD 內建的 PDF plotter 名稱
-_PDF_PLOTTER = "DWG To PDF.pc3"
+# PDF plotter 嘗試清單(依序測,第一個可用的就用)
+# AutoCAD PDF (General Documentation) 對中文嵌入比 DWG To PDF 完整,
+# 因為前者預設「Capture font properties」嵌入完整字型,後者只 subset。
+_PDF_PLOTTER_CANDIDATES = [
+    "AutoCAD PDF (General Documentation).pc3",
+    "AutoCAD PDF (High Quality Print).pc3",
+    "DWG To PDF.pc3",
+]
+_PDF_PLOTTER = _PDF_PLOTTER_CANDIDATES[-1]  # legacy 名稱,維持向下相容
 
 # 預設紙張 / 樣式（可被覆寫）
 _DEFAULT_PAPER = "ISO_full_bleed_A3_(420.00_x_297.00_MM)"
@@ -489,13 +496,22 @@ class _AutoCadSession:
             except Exception:
                 pass
 
-            try:
-                layout.ConfigName = _PDF_PLOTTER
-            except Exception as e:
+            # 依序試 plotter 清單,第一個可用就用
+            # "AutoCAD PDF (General Documentation).pc3" 字型嵌入完整,優先
+            chosen_plotter = None
+            for cand in _PDF_PLOTTER_CANDIDATES:
+                try:
+                    layout.ConfigName = cand
+                    chosen_plotter = cand
+                    _diag(f"plotter = {cand}")
+                    break
+                except Exception as e:
+                    _diag(f"plotter {cand!r} 不可用: {e}")
+                    continue
+            if chosen_plotter is None:
                 raise RuntimeError(
-                    f"AutoCAD 找不到 plotter '{_PDF_PLOTTER}'，"
-                    f"請確認 AutoCAD 安裝完整：{e}"
-                ) from e
+                    f"AutoCAD 找不到任何可用的 PDF plotter,請確認安裝完整"
+                )
 
             try:
                 layout.CanonicalMediaName = paper
@@ -524,28 +540,20 @@ class _AutoCadSession:
             except Exception:
                 pass
 
-            # 輸出策略:優先 SendCommand("_-EXPORTPDF") 走較新的 PDF engine
-            # (對中文字型嵌入 subset 處理較好);失敗 fallback 到 PlotToFile。
-            #
-            # _-EXPORTPDF (dash 版本) prompt 順序 (AutoCAD 2024):
-            #   Specify selection or [All/Window/Display/Extents]:  → _C (current)
-            #   或 Page setup override [Yes/No]: → _N
-            #   PDF filename: → "..."
-            # 多按 \n 緩衝跳過版本間 prompt 差異。
-            exported = _export_pdf_via_command(doc, pdf_path)
+            # 用 PlotToFile + 上面選好的 plotter (chosen_plotter)
+            # 不再嘗試 SendCommand("_-EXPORTPDF") —— 實測 AutoCAD 2024 不接此命令,
+            # 浪費 60 秒等待無意義。
+            plot = doc.Plot
+            ok = _com_retry(lambda: plot.PlotToFile(str(pdf_path)))
+            _diag(f"PlotToFile (plotter={chosen_plotter!r}) 回傳 ok={ok}")
+            if not ok:
+                raise RuntimeError(f"AutoCAD PlotToFile 回傳失敗:{dwg_path}")
 
-            if not exported:
-                _diag("EXPORTPDF 命令未產出 PDF,fallback 到 PlotToFile")
-                plot = doc.Plot
-                ok = _com_retry(lambda: plot.PlotToFile(str(pdf_path)))
-                _diag(f"PlotToFile 回傳 ok={ok}")
-                if not ok:
-                    raise RuntimeError(f"AutoCAD PlotToFile 回傳失敗:{dwg_path}")
-                # 等檔案落地
-                for _ in range(60):
-                    if pdf_path.is_file() and pdf_path.stat().st_size > 0:
-                        break
-                    time.sleep(0.3)
+            # 等檔案落地
+            for _ in range(60):
+                if pdf_path.is_file() and pdf_path.stat().st_size > 0:
+                    break
+                time.sleep(0.3)
 
             if not pdf_path.is_file() or pdf_path.stat().st_size == 0:
                 raise RuntimeError(f"PDF 沒有產生或為空檔：{pdf_path}")
