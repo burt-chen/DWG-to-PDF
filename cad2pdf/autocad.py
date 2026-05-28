@@ -248,6 +248,59 @@ except Exception:
     _CJK_FONTMAP_FILE = None
 
 
+_TEXT_OBJ_NAMES = (
+    "AcDbText", "AcDbMText",
+    "AcDbAttribute", "AcDbAttributeDefinition",
+)
+
+
+def _explode_text_to_geometry(doc) -> None:
+    """把 doc 內所有 TEXT/MTEXT/ATTRIB explode 成 geometry,plot 時就不用
+    字型嵌入,徹底繞過「PDF 嵌入字型 subset 不含 CJK glyph」的問題。
+
+    遍歷 ModelSpace + 所有 paper space layout.Block,收集 TEXT 類物件,
+    然後 Explode + Delete 原物件。read-write 開檔但 Close(False) 不存檔,
+    所以原 DWG 不會被改。
+    """
+    exploded = 0
+    skipped = 0
+
+    def _process_block(blk):
+        nonlocal exploded, skipped
+        targets = []
+        try:
+            for ent in blk:
+                try:
+                    if ent.ObjectName in _TEXT_OBJ_NAMES:
+                        targets.append(ent)
+                except Exception:
+                    continue
+        except Exception as e:
+            _diag(f"  iterate block 失敗: {e}")
+            return
+        for ent in targets:
+            try:
+                # Explode() 對 TrueType TEXT 會炸成 polyline 字形輪廓
+                ent.Explode()
+                ent.Delete()
+                exploded += 1
+            except Exception:
+                skipped += 1
+
+    try:
+        _process_block(doc.ModelSpace)
+        for layout in doc.Layouts:
+            try:
+                if layout.Name.lower() != "model":
+                    _process_block(layout.Block)
+            except Exception:
+                continue
+    except Exception as e:
+        _diag(f"explode 階段例外: {e}")
+
+    _diag(f"explode TEXT→geometry: exploded={exploded} skipped={skipped}")
+
+
 def _export_pdf_via_command(doc, pdf_path: Path) -> bool:
     """用 SendCommand 跑 _-EXPORTPDF 命令輸出 PDF。
 
@@ -475,12 +528,17 @@ class _AutoCadSession:
             _diag("doc.Regen(acAllViewports) done")
         except Exception as e:
             _diag(f"doc.Regen 失敗: {e}")
-            # fallback: SendCommand
             try:
                 doc.SendCommand("_REGENALL\n")
                 _diag("SendCommand(_REGENALL) sent")
             except Exception as e2:
                 _diag(f"SendCommand(_REGENALL) 失敗: {e2}")
+
+        # 終極大絕:把所有 TEXT / MTEXT / ATTRIB explode 成 geometry。
+        # 即使 plotter 嵌入字型 subset 不含 CJK glyph(PDF 顯示 ?),
+        # explode 後文字變成 polyline,plot 出 PDF 直接是 vector path,
+        # 不依賴任何字型嵌入。Close(False) 不存檔,原 DWG 不變。
+        _explode_text_to_geometry(doc)
 
         try:
             try:
