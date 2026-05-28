@@ -102,9 +102,11 @@ ProgressCb = Callable[[int, int, str], None]
 
 
 # PDF plotter 嘗試清單(依序測,第一個可用的就用)
-# AutoCAD PDF (General Documentation) 對中文嵌入比 DWG To PDF 完整,
-# 因為前者預設「Capture font properties」嵌入完整字型,後者只 subset。
+# 第一順位 "Adobe PDF" 是 Adobe Acrobat 安裝的系統印表機 ——
+# 使用者實測手動用它出 PDF 中文正常,字型嵌入比 AutoCAD 內建 .pc3 強壯。
+# .pc3 系列當 fallback(沒裝 Adobe Acrobat 時)。
 _PDF_PLOTTER_CANDIDATES = [
+    "Adobe PDF",
     "AutoCAD PDF (General Documentation).pc3",
     "AutoCAD PDF (High Quality Print).pc3",
     "DWG To PDF.pc3",
@@ -246,59 +248,6 @@ try:
     _CJK_FONTMAP_FILE = _build_cjk_fontmap_file()
 except Exception:
     _CJK_FONTMAP_FILE = None
-
-
-_TEXT_OBJ_NAMES = (
-    "AcDbText", "AcDbMText",
-    "AcDbAttribute", "AcDbAttributeDefinition",
-)
-
-
-def _explode_text_to_geometry(doc) -> None:
-    """把 doc 內所有 TEXT/MTEXT/ATTRIB explode 成 geometry,plot 時就不用
-    字型嵌入,徹底繞過「PDF 嵌入字型 subset 不含 CJK glyph」的問題。
-
-    遍歷 ModelSpace + 所有 paper space layout.Block,收集 TEXT 類物件,
-    然後 Explode + Delete 原物件。read-write 開檔但 Close(False) 不存檔,
-    所以原 DWG 不會被改。
-    """
-    exploded = 0
-    skipped = 0
-
-    def _process_block(blk):
-        nonlocal exploded, skipped
-        targets = []
-        try:
-            for ent in blk:
-                try:
-                    if ent.ObjectName in _TEXT_OBJ_NAMES:
-                        targets.append(ent)
-                except Exception:
-                    continue
-        except Exception as e:
-            _diag(f"  iterate block 失敗: {e}")
-            return
-        for ent in targets:
-            try:
-                # Explode() 對 TrueType TEXT 會炸成 polyline 字形輪廓
-                ent.Explode()
-                ent.Delete()
-                exploded += 1
-            except Exception:
-                skipped += 1
-
-    try:
-        _process_block(doc.ModelSpace)
-        for layout in doc.Layouts:
-            try:
-                if layout.Name.lower() != "model":
-                    _process_block(layout.Block)
-            except Exception:
-                continue
-    except Exception as e:
-        _diag(f"explode 階段例外: {e}")
-
-    _diag(f"explode TEXT→geometry: exploded={exploded} skipped={skipped}")
 
 
 def _export_pdf_via_command(doc, pdf_path: Path) -> bool:
@@ -534,11 +483,9 @@ class _AutoCadSession:
             except Exception as e2:
                 _diag(f"SendCommand(_REGENALL) 失敗: {e2}")
 
-        # 終極大絕:把所有 TEXT / MTEXT / ATTRIB explode 成 geometry。
-        # 即使 plotter 嵌入字型 subset 不含 CJK glyph(PDF 顯示 ?),
-        # explode 後文字變成 polyline,plot 出 PDF 直接是 vector path,
-        # 不依賴任何字型嵌入。Close(False) 不存檔,原 DWG 不變。
-        _explode_text_to_geometry(doc)
+        # 註:之前嘗試過 explode TEXT 為 geometry,但 AutoCAD COM 的
+        # ent.Explode() 對 TEXT entity 不會炸成 polyline(需要 Express
+        # Tools 的 TXTEXP 命令)。目前依賴 Adobe PDF 印表機正確嵌入中文。
 
         try:
             try:
